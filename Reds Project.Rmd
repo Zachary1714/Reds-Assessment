@@ -1,0 +1,919 @@
+---
+title: "Cincinnati Reds Assessment"
+author: "Zach Houghtaling"
+date: "2022-10-23"
+output: html_document 
+#runtime: shiny
+---
+
+```{r R Markdown setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Part A
+--------------------------------------------------------------------
+
+```{r Load in relevant packages, echo=T,results='hide', warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(randomForest)
+library(xgboost)
+library(tictoc)
+library(caret)
+library(baseballr)
+library(shiny)
+library(rsconnect)
+```
+```{r Load in the data,warning=F}
+initial_pitches <- read_xlsx("C:/Users/zacha/OneDrive/Desktop/Career Work/Example Projects/Reds Project/2023 Analytics Internship Problem Dataset.xlsx")
+
+```
+
+Before we create any models or analysis, we must thoroughly investigate our data set and all the variables included
+
+```{r Data preprocessing,warning=F}
+#Hold the original data frame, view the data frame
+pitches <- initial_pitches
+#str(pitches)
+#Some variables do not have the proper variable type so we will have to correct that
+
+#Recode the variables to the correct type
+pitches$THROW_SIDE_KEY <- factor(pitches$THROW_SIDE_KEY)
+pitches$BAT_SIDE_KEY <- factor(pitches$BAT_SIDE_KEY)
+pitches$PITCH_NUMBER <- as.numeric(pitches$PITCH_NUMBER)
+pitches$PITCH_RESULT_KEY <- factor(pitches$PITCH_RESULT_KEY)
+pitches$EVENT_RESULT_KEY <- factor(pitches$EVENT_RESULT_KEY)
+pitches$PITCH_TYPE_KEY <- factor(pitches$PITCH_TYPE_KEY)
+pitches$HORIZONTAL_BREAK <- as.numeric(pitches$HORIZONTAL_BREAK)
+pitches$INDUCED_VERTICAL_BREAK <- as.numeric(pitches$INDUCED_VERTICAL_BREAK)
+pitches$SPIN_DIRECTION <- as.numeric(pitches$SPIN_DIRECTION)
+
+#Double check the type and view the factors' levels
+#str(pitches)
+pitches %>% 
+  select_if(is.factor) %>% 
+  sapply(levels)
+
+#Hold this data frame for part B
+visuals <- pitches %>% filter(PITCHER_KEY=='A'|PITCHER_KEY=='B')
+
+#Loop to view all NA values
+for(i in 1:length(pitches)){
+  if(i == 1){
+    print("NA Values by variable:")
+  }
+  print(paste0(colnames(pitches[i]),":",sum(is.na(pitches[i]))))
+}
+```
+
+There are the most missing values for INDUCED_VERTICAL_BREAK as expected since that is our response variable. The hawkeye or trackman tracker also appears to occasionally miss RELEASE_EXTENSION, HORIZONTAL_BREAK, as well as SPIN_RATE and SPIN_DIRECTION. This will make random forest modeling difficult if some of these are missed in our test set of player A and B's second half pitches.
+
+That being said, we do need to split the dataset into training and validation with our test set being player A and player B's second half pitches.
+
+```{r Train-Validation-Test Split}
+pitches <- pitches %>% 
+  dplyr::mutate(id = row_number()) %>% 
+  drop_na(PITCH_NUMBER)
+
+#Set aside all playerA and playerB pitches to possibly double check
+#their first half ranges of INDUCED_VERTICAL_BREAK later on
+playerA <- pitches %>% 
+  dplyr::filter(PITCHER_KEY=="A")
+playerB <- pitches %>% 
+  dplyr::filter(PITCHER_KEY=="B")
+
+test <- pitches %>% 
+  dplyr::filter((PITCHER_KEY=="A"& is.na(INDUCED_VERTICAL_BREAK))|
+                (PITCHER_KEY=="B"& is.na(INDUCED_VERTICAL_BREAK)))
+paste0(round((nrow(test)/nrow(pitches))*100,3),
+       "% of the population is in the test as pitches player A & B threw in the 2nd half")
+
+#Print out that 0.515% of the population is in the test  as pitches player A & B threw in the 2nd half
+
+#Get the remainder of the observations without the test set
+pitches_no_response <- pitches %>% 
+  filter(!(id %in% test$id)) %>% 
+  drop_na(INDUCED_VERTICAL_BREAK)
+#Rows were removed without INDUCED_VERTICAL_BREAK since there would be no response variable to predict and compare in those rows
+
+#70-30 split of the remainder of our dataset
+set.seed(17) #replicable seed
+train <- pitches_no_response %>% sample_frac(0.7)
+validation <- anti_join(pitches_no_response, train, by = 'id')
+
+#Remove the id variable which is just 
+#the row number from each data frame
+train <- train %>% dplyr::select(-c(id))          
+validation <- validation %>% dplyr::select(-c(id))
+test <- test %>% dplyr::select(-c(id))
+```
+
+Now that the data has been split 70-30 to get the most accurate INDUCED_VERTICAL_BREAK,my baseball intuition still says we should split it up by pitch type creating new data sets of train, validation, and test based on player A & player B's pitch repertoire
+
+```{r Splitting the data by pitch type}
+types <- factor(test$PITCH_TYPE_KEY)
+pitch_types <- levels(types)
+pitch_names <- c("Curveball", "Change Up", "Fastball",
+                 "Four Seam FB", "Sinker", "Slider", "Unknown")
+```
+
+We will now have to create a list of data for each of the pitch types for train split by pitch type.
+We also must remove throw side for Sinker & Unidentified since only lefties vs righty batters with null events can properly model our test for these cases
+
+```{r Train Loop Split by Pitch Type }
+train_pitches <- NULL
+train_pitches_x <- NULL
+train_pitches_y <- NULL
+train_pitches[[i]] <- list(seq(1:length(pitch_types)))
+
+options(na.action='na.pass')
+for(i in 1:length(pitch_types)){
+  if(pitch_types[i] != 'SI' & pitch_types[i] != 'UN'){
+    train_pitches[[i]] <- train %>% 
+      dplyr::filter(PITCH_TYPE_KEY==pitch_types[i])
+    
+    #Add dummy variables for categorical factors for xgboost
+    train_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -PITCHER_KEY,
+      data = train_pitches[[i]])[, -1]
+  }
+  else if(pitch_types[i] == 'SI'){ 
+    #For sinkers only lefty vs right with null events
+    train_pitches[[i]] <- train %>% 
+      dplyr::filter(PITCH_TYPE_KEY=='SI' & THROW_SIDE_KEY=='L' & 
+                    BAT_SIDE_KEY=='R' & EVENT_RESULT_KEY=='NULL')
+
+    #Add dummy variables for categorical factors for xgboost
+    train_pitches[[i]]$PITCHER_KEY <- NULL
+    train_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -THROW_SIDE_KEY 
+      -BAT_SIDE_KEY -EVENT_RESULT_KEY,
+      data = train_pitches[[i]])[, -1]
+  }
+  #Otherwise it should be unknown of only lefty v right
+  else{ 
+    train_pitches[[i]] <- train %>%
+      dplyr::filter(PITCH_TYPE_KEY=='UN' & THROW_SIDE_KEY=='L' & 
+                    BAT_SIDE_KEY=='R')
+    
+    #Add dummy variables for categorical factors for xgboost
+    train_pitches[[i]]$PITCHER_KEY <- NULL
+    train_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ . -GAME_CODE -THROW_SIDE_KEY, 
+      data = train_pitches[[i]])[, -1]
+  }
+  
+  #Create a list of vectors of the response variable by pitch type
+  train_pitches_y[[i]] <- train_pitches[[i]]$INDUCED_VERTICAL_BREAK
+}
+```
+
+We also have to do the same loop of the data by pitch type for our validation
+
+```{r Validation Loop Data Split by Pitch Type}
+validation_pitches <- NULL
+validation_pitches_x <- NULL
+validation_pitches_y <- NULL
+for(i in 1:length(pitch_types)){
+  if(pitch_types[[i]] != 'SI' & pitch_types[i] != 'UN'){
+    validation_pitches[[i]] <- validation %>%
+      dplyr::filter(PITCH_TYPE_KEY==pitch_types[i])
+    
+    #Add dummy variables for categorical factors for xgboost
+    validation_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -PITCHER_KEY,
+      data = validation_pitches[[i]])[, -1]
+  }
+  #For sinkers only lefty vs right with null events
+  else if(pitch_types[i] == 'SI'){ 
+    validation_pitches[[i]] <- validation %>%
+      dplyr::filter(PITCH_TYPE_KEY=='SI' & THROW_SIDE_KEY=='L' &
+                    BAT_SIDE_KEY=='R' & EVENT_RESULT_KEY=='NULL')
+    
+    #Add dummy variables for categorical factors for xgboost
+    validation_pitches[[i]]$PITCHER_KEY <- NULL
+    validation_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -THROW_SIDE_KEY         
+      -BAT_SIDE_KEY -EVENT_RESULT_KEY, 
+      data = validation_pitches[[i]])[, -1]
+  }
+  #Otherwise it should be unknown of only lefty v right
+  else{ 
+    validation_pitches[[i]] <- validation %>%
+      dplyr::filter(PITCH_TYPE_KEY=='UN' & THROW_SIDE_KEY=='L' & 
+                    BAT_SIDE_KEY=='R')
+    
+    #Add dummy variables for categorical factors for xgboost
+    validation_pitches[[i]]$PITCHER_KEY <- NULL
+    validation_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ . -GAME_CODE -THROW_SIDE_KEY,
+      data = validation_pitches[[i]])[, -1]
+  }
+  
+  #Create a list of vectors of the response variable by pitch type
+  validation_pitches_y[[i]] <- validation_pitches[[i]]$INDUCED_VERTICAL_BREAK
+}
+```
+
+And finally, we have to loop through to split our test set by pitch type
+
+```{r Test Loop Data Split by Pitch Type}
+test_pitches <- NULL
+test_pitches_x <- NULL
+test_pitches_y <- NULL
+for(i in 1:length(pitch_types)){
+  if(pitch_types[i] != 'SI' & pitch_types[i] != 'UN'){
+    test_pitches[[i]] <- test %>% 
+      dplyr::filter(PITCH_TYPE_KEY==pitch_types[i])
+    
+    #Add dummy variables for categorical factors for xgboost
+    test_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -PITCHER_KEY, 
+      data = test_pitches[[i]])[, -1]
+  }
+  #For sinkers only lefty vs right with null events because that's all we can make assumptions on for the testing set
+  else if(pitch_types[i] == 'SI'){ 
+    test_pitches[[i]] <- test %>%
+      dplyr::filter(PITCH_TYPE_KEY=='SI')
+    
+    #Add dummy variables for categorical factors for xgboost
+    test_pitches[[i]]$PITCHER_KEY <- NULL
+    test_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -THROW_SIDE_KEY 
+      -BAT_SIDE_KEY -EVENT_RESULT_KEY, 
+      data = test_pitches[[i]])[, -1]
+  }
+  #Otherwise it should be unknown of only lefty v right
+  else{ 
+    test_pitches[[i]] <- test %>%
+      dplyr::filter(PITCH_TYPE_KEY==pitch_types[i])
+    
+    #Add dummy variables for categorical factors for xgboost
+    # Drop the "ID" and "Value" columns
+    test_pitches[[i]]$PITCHER_KEY <- NULL
+    test_pitches_x[[i]] <- model.matrix(
+      INDUCED_VERTICAL_BREAK ~ .-GAME_CODE -THROW_SIDE_KEY,
+      data = test_pitches[[i]])[, -1]
+  }
+}
+
+```
+
+As far as modeling techniques, we set the data up for to create 7 XGBoost (Extreme Gradient Boosting) models for each of the 7 pitches. Since there are missing values throughout the data set a random forest could not be created without imputation or removal of these values so I opted to use the XGBoost for my predictions
+
+```{r XGBoost Modeling Prep}
+#10 fold cross validation model testing the root mean squared error 
+#for 800 different rounds - computationally intensive
+#Will find out which number of rounds is the best based on the testing
+
+#Initialize lists for variables we will use
+best.xgb <- list(seq(1:length(pitch_types)))
+xg_important_vars <- list(seq(1:length(pitch_types)))
+
+```
+Since the XGBoost tuning is very computationally intensive this section is all commented out. It loops through: 
+200 rounds finding the minimum test rmse on 10-fold cross validation
+max depth values from 1 to 10
+eta values of 0.1, 0.15, 0.2, 0.25, 0.3
+sub sample values of 0.25, 0.5, 0.75, 1.
+
+```{r Loop of 7 training models to tune each XGBoost Model}
+#tic()
+#Initialize lists for variables we will use
+#xgModel <- list(seq(1:length(pitch_types)))
+#xgb.caret <- list(seq(1:length(pitch_types)))
+#xgb.results <- list(seq(1:length(pitch_types)))
+#nrounds <- list(seq(1:length(pitch_types)))
+
+#eta <- NULL
+#max_depth <- NULL
+#subsample <- NULL
+
+
+#for(i in 1:length(pitch_types)){
+  #set.seed(17)
+  #xgModel[[i]] <- xgb.cv(data = train_pitches_x[[i]], 
+                          #label = train_pitches_y[[i]], 
+                          #nrounds = 200,
+                          #objective = "reg:squarederror", nfold=10)
+  ###Which number of rounds has the lowest test rmse
+  #nrounds[[i]] <- which(xgModel[[i]]$evaluation_log$test_rmse_mean                 #== min(xgModel[[i]]$evaluation_log$test_rmse_mean))
+  #nround_finder <- data.frame(
+  #  cbind(
+  #    as.numeric(xgModel[[i]]$evaluation_log$iter),
+  #    as.numeric(xgModel[[i]]$evaluation_log$test_rmse_mean)
+  #    )
+  #  )
+  #print(ggplot(data=nround_finder,aes(x=X1,y=X2)) +
+    #geom_point() +
+    #xlab('Iteration') +
+    #ylab('Test RMSE Mean Value') +
+    #ggtitle('Finding nrounds Value'))
+  
+  ###tuning through caret initialization
+  #tune_grid <- expand.grid(
+  #  nrounds = nrounds[[i]],
+  #  eta = c(0.1, 0.15, 0.2, 0.25, 0.3),
+  #  max_depth = c(1:10),
+  #  gamma = c(0),
+  #  colsample_bytree = 1,
+  #  min_child_weight = 1,
+  #  subsample = c(0.25, 0.5, 0.75, 1)
+  #)
+
+  ###Only do this the first time before the best model is found (computationally intensive)
+  ###Find the model that is tuned with the best parameters that were chosen above to test (1 to 10 different depth levels, 5 potential eta values and 4 potential subsample values)
+  #set.seed(17)
+  #xgb.caret[[i]] <- train(x = train_pitches_x[[i]], y = train_pitches_y[[i]],
+  #                   method = "xgbTree",
+  #                   tuneGrid = tune_grid,
+  #                   trControl = trainControl(method = 'cv', # Using 10-fold cross-validation
+  #                                            number = 10))
+  ###Look for the lowest point on this graph
+  #print(plot(xgb.caret[[i]]))
+  
+
+###Inputting the eta, max_depth, subsample, and nrounds that minimized
+###the RMSE in the caret cross validation model
+#  eta[i] <- xgb.caret[[i]]$bestTune$eta
+#  max_depth[i] <- xgb.caret[[i]]$bestTune$max_depth
+#  subsample[i] <- xgb.caret[[i]]$bestTune$subsample
+#  nrounds[i] <- xgb.caret[[i]]$bestTune$nrounds
+#}
+#toc() #Running this took 89508.81 sec but we now have the best tune
+```
+
+Now that the values for eta, max_depth, subsample, and nrounds were acquired from tuning for the smallest root mean squared error value, we can create our best XGBoost model split up by the different pitch types.
+
+```{r XGBoost Model Creation, echo=T,results='hide'}
+#Manually inputting the best XGBoost Tuning Parameters for our 7 models acquired from xgb.caret's minimized rmse
+eta <- c(0.10,0.25,0.10,0.20,0.10,0.25,0.10)
+max_depth <- c(8,6,10,6,8,6,10)
+subsample <- c(0.75,0.75,0.50,0.75,0.75,1.00,0.50)
+nrounds <- c(199,200,200,200,200,200,200)
+
+#Loop to get the best model for each of the 7 models
+for(i in 1:length(pitch_types)){
+  set.seed(17)
+  best.xgb[[i]] <- xgboost(data=train_pitches_x[[i]],
+                           label=train_pitches_y[[i]],
+                           eta=eta[i],
+                           nrounds = nrounds[i],
+                           max_depth=max_depth[i],
+                           subsample=subsample[i])
+  
+  #Which variables were important in our best xgboost model
+  set.seed(17)
+  xg_important_vars[[i]] <- xgb.importance(
+    feature_names = colnames(train_pitches_x[[i]]), 
+    model = best.xgb[[i]])
+  
+  xgb.ggplot.importance(xgb.importance(
+    feature_names = colnames(train_pitches_x[[i]]), 
+    model = best.xgb[[i]]))
+}
+```
+
+Now that we've created the models, we want to go back and check how they perform on our validation data set (30% of the data). Before we check our findings with the validation, however, the average, deviance, and deviance squared need to be calculated of our response values 
+
+```{r Response Deviance Calculation}
+avg <- list(seq(1:length(pitch_types)))
+dev <- list(seq(1:length(pitch_types)))
+dev_sq <- list(seq(1:length(pitch_types)))
+
+
+#Used for all R-squared calculations as the Sum of Deviance Squared
+for(i in 1:length(pitch_types)){
+  avg[[i]] <- mean(validation_pitches_y[[i]])
+  dev[[i]] <- validation_pitches_y[[i]] - avg[[i]]
+  dev_sq[[i]] <- sum(dev[[i]]^2)
+}
+```
+
+We need to now go back and check the XGBoost Models we created to see how they performed on the validation data set. We will calculate the Mean Absolute Error and the R-Squared value for each of the 7 models
+
+```{r Checking Model Predictions with Validation Data}
+xg_predictions <- list(seq(1:length(pitch_types)))
+xg_diff <- list(seq(1:length(pitch_types)))
+xg_diff_sq <- list(seq(1:length(pitch_types)))
+xg_rsq <- list(seq(1:length(pitch_types)))
+MAE_xg <- list(seq(1:length(pitch_types)))
+
+for(i in 1:length(pitch_types)){
+  xg_predictions[[i]] <- predict(best.xgb[[i]], 
+                                 validation_pitches_x[[i]])
+  xg_diff[[i]] <- validation_pitches_y[[i]] - xg_predictions[[i]]
+  xg_diff_sq[[i]] <- sum(xg_diff[[i]]^2)
+  xg_rsq[[i]] <- 1-(xg_diff_sq[[i]]/dev_sq[[i]])
+  MAE_xg[[i]] <- mean(abs(xg_diff[[i]]))
+  print(paste0("The R-Squared value for the ",pitch_names[i],
+               " model was: ", round(xg_rsq[[i]],4)))
+  print(paste0("The MAE value for the ",pitch_names[i],
+                " model was: ", round(MAE_xg[[i]],3)))
+}
+
+```
+
+Our 7 models were able to explain between 93.9% (Fastball) to 99.4% (Unknown) of the variation of VERTICAL_INDUCED_BREAK using each of the 7 different XGBoost models on our validation data set (30% of the original data). The mean absolute error of each of the models predictions ranged from 0.334 inches (Sinker Model) to 0.584 inches (Four Seam Fastball Model) of the actual VERTICAL_INDUCED_BREAK when tested on the validation data set.
+
+```{r Creating Predictions of Test Set and break.csv}
+xg_predictions_test <- list(seq(1:length(pitch_types)))
+predictions <- NULL
+test_vals <- NULL
+ 
+for(i in 1:length(pitch_types)){
+  xg_predictions_test[[i]] <- predict(best.xgb[[i]],test_pitches_x[[i]])
+  predictions <- rbind(data.frame(predictions),
+                       data.frame(xg_predictions_test[[i]]))
+  test_vals <- bind_rows(data.frame(test_vals),
+                         data.frame(test_pitches[[i]]))
+}
+colnames(predictions) <- c("PREDICTED_INDUCED_VERTICAL_BREAK")
+predictions <- cbind(predictions,test_vals)
+#Add back in the "B" for the UN/SI Pitch Types that only "B" Throws
+predictions$PITCHER_KEY <- ifelse(
+  is.na(predictions$PITCHER_KEY),"B",predictions$PITCHER_KEY)
+write.csv(predictions,'break.csv',row.names=F)
+```
+
+We have now created break.csv and completed part A! As a next step for Part A, and with more than 8 hours for the assessment I would have done additional models and compared to create an ensemble model that could minimize the prediction error even further. 
+
+Part B
+--------------------------------------------------------------------
+
+```{r Visualizing Metrics GGPlot, warning=F}
+library(shiny)
+#str(visuals)
+group.colors <- c(CB = "#333BFF", CH = "#CC6600", FB ="#9633FF",
+                  FF = "#FF0000", SI = "#E3DB71", SL = "#ADD8E6",
+                  UN = "#000000")
+pitcher.colors <- c(A= "#333BFF", B = "#FF0000")
+
+ggplot(visuals,aes(PITCH_TYPE_KEY, RELEASE_SPEED,fill=PITCHER_KEY)) +
+  geom_boxplot() +
+  ylab('Pitch Velocity at Release') +
+  xlab('Pitcher') +
+  ggtitle('Comparison of Velocity by Pitch Type') +
+  scale_fill_manual(values=pitcher.colors)
+
+ggplot(visuals,aes(PITCH_TYPE_KEY, SPIN_RATE,fill=PITCHER_KEY)) +
+  geom_boxplot() +
+  #facet_wrap(~ PITCH_TYPE_KEY) +
+  ylab('Pitch Spin Rates') +
+  xlab('Pitch Types') +
+  ggtitle('Comparison of Spin Rate by Pitch Type') +
+  scale_fill_manual(values=pitcher.colors)
+
+ggplot(visuals, aes(PLATE_X, PLATE_Z)) +
+  geom_point(aes(color = PITCHER_KEY)) +
+  facet_wrap(~ PITCH_TYPE_KEY) +
+  geom_rect(mapping = aes(ymax = 3.56, ymin = 1.6, 
+                          xmax = -1, xmin = 1), alpha = 0, size=0.2,
+                          colour = "black") +
+  ylab(NULL) +
+  xlab(NULL) +
+  ggtitle('Comparison of Locations Colored by Pitcher') +
+  labs(color="Pitch Type") +
+  scale_color_manual(values=pitcher.colors)
+
+
+
+```
+
+I created these visuals in ggplot all split up by pitch types to show the Pitch Velocities for all of player A and B's pitches, the Spin Rates for all of player A and B's pitches and the location of player A and B's pitches. If a proper time component was included as either their game sequence or the date, I would have plotted some trends over time but there was no certainty in the order of the games player A and player B played in. These plots will need to be remade as R Shiny Plots to have 4 dashboards (An additional one of all pitch types overlaid on one graph for each pitcher) to compare the two players.
+
+```{r Shiny Plot 1}
+load <- function() {
+  if ( require( "ggplot2" ) != TRUE ) {
+    print( "Required library 'ggplot2' could not be loaded" )
+    return( FALSE )
+  } else if ( require( "shiny" ) != TRUE ) {
+    print( "Required library 'shiny' could not be loaded" )
+    return( FALSE )
+  } else {
+    return( TRUE )
+  }
+}
+
+if ( load() == TRUE ) {
+  hist_ui1 <- fluidPage(
+    titlePanel( "Pitch Type Distribution"),
+    sidebarLayout(
+      sidebarPanel(
+        checkboxGroupInput(
+         "pitcher",
+         "Player:",
+         c( "Player A" = "A",
+            "Player B" = "B"),
+         inline = TRUE,
+         selected = c("A","B"),
+       ),
+       checkboxGroupInput(
+         "pitch_type",
+         "Pitch Type:",
+         c( "Curveball" = "CB",
+            "Change Up" = "CH",
+            "Fastball" = "FB",
+            "Four Seam FB" = "FF",
+            "Slider" = "SL",
+            "Sinker" = "SI",
+            "Unknown" = "UN"),
+         inline = TRUE,
+         selected = c("FB"))
+       ),
+      sliderInput(
+         "iqr",
+         "Outlier IQR:",
+         min = 0.5,
+         max = 3.0,
+         step = 0.25,
+         value = 1.5
+       )
+     ),
+      mainPanel(
+        plotOutput( "distPlot" )
+      )
+    )
+
+  hist_server1 <- function( input, output ) {
+    output$distPlot <- renderPlot( {
+  ggplot(data= (visuals %>% 
+                      filter(PITCHER_KEY==input$pitcher) %>%
+                      filter(PITCH_TYPE_KEY == input$pitch_type)),
+         aes(PITCH_TYPE_KEY, RELEASE_SPEED,fill=PITCHER_KEY)) +
+  geom_boxplot(coef=input$iqr) +
+  ylab('Pitch Release Velocities') +
+  xlab('Pitch Type') +
+  ggtitle('Comparison of Pitch Release Velocities by Pitch Type') +
+  scale_fill_manual(values=pitcher.colors)
+    } )
+  }
+
+  shinyApp( ui = hist_ui1, server = hist_server1 )
+} 
+```
+Above is the Shiny box plot of pitch velocities for each of the pitchers split by pitch type. You can select either player A or B or both. All combinations of pitch type are accepted as well. Next will be the plot of all the spin rates by pitch type.
+
+```{r Shiny Plot 2}
+if ( load() == TRUE ) {
+  hist_ui2 <- fluidPage(
+    titlePanel( "Pitch Type Distribution" ),
+    sidebarLayout(
+      sidebarPanel(
+        checkboxGroupInput(
+         "pitcher",
+         "Player:",
+         c( "Player A" = "A",
+            "Player B" = "B"),
+         inline = TRUE,
+         selected = c("A","B")
+       ),
+       checkboxGroupInput(
+         "pitch_type",
+         "Pitch Type:",
+         c( "Curveball" = "CB",
+            "Change Up" = "CH",
+            "Fastball" = "FB",
+            "Four Seam FB" = "FF",
+            "Slider" = "SL",
+            "Sinker" = "SI",
+            "Unknown" = "UN"),
+         inline = TRUE,
+         selected = c("CB"))
+       ),
+      sliderInput(
+         "iqr",
+         "Outlier IQR:",
+         min = 0.5,
+         max = 3.0,
+         step = 0.25,
+         value = 1.5
+       )
+     ),
+      mainPanel(
+        plotOutput( "distPlot" )
+      )
+    )
+
+  
+  hist_server2 <- function( input, output ) {
+    output$distPlot <- renderPlot( {
+  ggplot(data= (visuals %>% 
+                      filter(PITCHER_KEY==input$pitcher) %>%
+                      filter(PITCH_TYPE_KEY == input$pitch_type)),
+         aes(PITCH_TYPE_KEY, SPIN_RATE,fill=PITCHER_KEY)) +
+  geom_boxplot(coef=input$iqr) +
+  ylab('Pitch Spin Rates (RPM)') +
+  xlab('Pitcher') +
+  ggtitle('Comparison of Spin Rate by Pitch Type') +
+  scale_fill_manual(values=pitcher.colors)
+    } )
+  }
+  
+  
+  shinyApp( ui = hist_ui2, server = hist_server2 )
+}
+```
+Above we created the Shiny box plot of all the spin rates by pitch type. Similar to the last plot you can select all combinations of pitcher and pitch type. Next is the location of each of the pitch types.
+
+```{r Shiny Plot 3}
+if ( load() == TRUE ) {
+  hist_ui3 <- fluidPage(
+    titlePanel( "Pitch Type Distribution" ),
+    sidebarLayout(
+      sidebarPanel(
+        checkboxGroupInput(
+         "pitcher",
+         "Player:",
+         c( "Player A" = "A",
+            "Player B" = "B"),
+         inline = TRUE,
+         selected = c("A","B")
+       ),
+       checkboxGroupInput(
+         "pitch_type",
+         "Pitch Type:",
+         c( "Curveball" = "CB",
+            "Change Up" = "CH",
+            "Fastball" = "FB",
+            "Four Seam FB" = "FF",
+            "Slider" = "SL"),
+         inline = TRUE,
+         selected = c("CB","CH","FB","FF",
+                      "SL"))
+       ),
+      mainPanel(
+        plotOutput( "distPlot" )
+      )
+    )
+  )
+  
+  hist_server3 <- function( input, output ) {
+    output$distPlot <- renderPlot( {
+  ggplot(data= (visuals %>%
+                      filter(PITCH_TYPE_KEY == input$pitch_type) %>%
+                      filter(PITCHER_KEY==input$pitcher)), aes(PLATE_X, PLATE_Z)) +
+  geom_point(aes(color = PITCHER_KEY)) +
+  facet_wrap(~ PITCH_TYPE_KEY) +
+  geom_rect(mapping = aes(ymax = 3.56, ymin = 1.6, 
+                          xmax = -1, xmin = 1), alpha = 0, size=0.2,
+                          colour = "black") +
+  ylab(NULL) +
+  xlab(NULL) +
+  ggtitle('Comparison of Locations Colored by Pitcher') +
+  scale_color_manual(values=pitcher.colors)
+    } )
+  }
+  shinyApp( ui = hist_ui3, server = hist_server3 )
+}
+```
+
+Once again above is the graph of all the locations across the pitch types with an average strike zone overlaid. All combinations of pitch type and pitcher can be chosen. Finally will be a new single graph of pitch locations of all pitch types selected for a single pitcher.
+
+```{r Shiny Plot 4}
+if ( load() == TRUE ) {
+  hist_ui4 <- fluidPage(
+    titlePanel( "Pitch Type Distribution" ),
+    sidebarLayout(
+      sidebarPanel(
+        radioButtons(
+         "pitcher",
+         "Player:",
+         c( "Player A" = "A",
+            "Player B" = "B"),
+         inline = TRUE,
+         selected = c("A")
+       ),
+       checkboxGroupInput(
+         "pitch_type",
+         "Pitch Type:",
+         c( "Curveball" = "CB",
+            "Change Up" = "CH",
+            "Fastball" = "FB",
+            "Four Seam FB" = "FF",
+            "Slider" = "SL",
+            "Sinker" = "SI",
+            "Unknown" = "UN"),
+         inline = TRUE,
+         selected = c("CB","CH","FB","FF",
+                      "SL","SI","UN"))
+       ),
+      mainPanel(
+        plotOutput( "distPlot" )
+      )
+    )
+  )
+  
+  hist_server4 <- function( input, output ) {
+    output$distPlot <- renderPlot( {
+  ggplot((visuals %>% filter(PITCH_TYPE_KEY == input$pitch_type,PITCHER_KEY==input$pitcher)), aes(PLATE_X, PLATE_Z)) +
+  geom_point(aes(color = PITCH_TYPE_KEY)) +
+  geom_rect(mapping = aes(ymax = 3.56, ymin = 1.6, 
+                          xmax = -1, xmin = 1), alpha = 0, size=0.2,
+                          colour = "black") +
+  ylab(NULL) +
+  xlab(NULL) +
+  ggtitle(paste0('Locations Colored by Pitch Type - Pitcher ',
+                 input$pitcher)) +
+  labs(color="Pitch Type") +
+  scale_color_manual(values =group.colors)
+    } )
+  }
+  shinyApp( ui = hist_ui4, server = hist_server4 )
+}
+
+```
+
+In this final dashboard of all selected pitch types for a pitcher only player A or B can be selected at once. You can filter by whatever pitch types are desired, however.
+
+Part C
+--------------------------------------------------------------------
+
+Before we make a decision on the better player based on the visuals lets add a few metrics such as IP and FIP while also doing some statistical tests on that FB Velocity, CB Spin Rate, as well as their outcome percentages such as called strike % and balls put in play %
+```{r Creating More Metrics to Evaluate A and Bs Results}
+#From the dataframes for players A and B we with held let's look at all of their events to calculate the outcome of their opposing balls in play
+playerA_events <- playerA %>% filter(EVENT_RESULT_KEY != "NULL")
+playerB_events <- playerB %>% filter(EVENT_RESULT_KEY != "NULL")
+playerA_event_levels <- levels(factor(playerA_events$EVENT_RESULT_KEY))
+playerB_event_levels <- levels(factor(playerB_events$EVENT_RESULT_KEY))
+playerA_event_levels
+playerB_event_levels
+
+#Calculate the frequency each of the results occurred for player A
+playerA_results <- data.frame(playerA_event_levels)
+playerA_results$playerA_Freq <- 0
+for(i in 1:nrow(playerA_results)){
+  playerA_results$playerA_Freq[i] <- playerA_events %>% 
+    filter(EVENT_RESULT_KEY==playerA_event_levels[i]) %>%
+    nrow()
+}
+
+#Calculate the frequency each of the results occurred for player B
+playerB_results <- data.frame(playerB_event_levels)
+playerB_results$playerB_Freq <- 0
+for(i in 1:nrow(playerB_results)){
+  playerB_results$playerB_Freq[i] <- playerB_events %>% 
+    filter(EVENT_RESULT_KEY==playerB_event_levels[i]) %>%
+    nrow()
+}
+
+#Join the results together and fill the NA values with 0 since that is an event with a 0 count for that pitcher
+player_results <- full_join(playerA_results,playerB_results, by=c("playerA_event_levels"="playerB_event_levels"))
+player_results[is.na(player_results)] <- 0
+
+#Creating the column names for player results
+outcomes <- player_results$playerA_event_levels
+player_results$playerA_event_levels <- NULL
+player_results <- data.frame(t(player_results))
+colnames(player_results) <- outcomes
+
+cFIP <- 3.113 #Major League FIP Constant to make it like ERA measure when
+#we calculate it below
+
+player_results <- player_results %>% 
+  mutate(IP=sum(strikeout,
+                force_out,
+                2*double_play,
+                2*grounded_into_double_play,
+                2*strikeout_double_play,
+                caught_stealing_2b,
+                caught_stealing_3b,
+                caught_stealing_home,
+                pickoff_1b,
+                pickoff_caught_stealing_2b,
+                sac_fly,
+                fielders_choice_out,
+                field_out)/3,
+         k_per_bb=(strikeout+strikeout_double_play)/(walk),
+         SBA=sum(stolen_base_2b,
+                 stolen_base_3b,
+                 caught_stealing_2b,
+                 caught_stealing_3b,
+                 caught_stealing_home,
+                 strikeout_double_play,
+                 pickoff_caught_stealing_2b),
+         SB=sum(stolen_base_2b,
+                stolen_base_3b),
+         Hits_allowed=sum(single,
+                          double,
+                          triple,
+                          home_run)) %>%
+   mutate(WHIP =(walk + hit_by_pitch + Hits_allowed)/ IP,
+          FIP = cFIP + (( (13*home_run) + (3*(walk+hit_by_pitch)) -
+                (2*(strikeout+strikeout_double_play) )) / IP),
+          SB_perc= (SB/SBA),
+          CS_perc= 1-(SB/SBA))
+
+#Pull in the Average FB Velo and CB Spin Rate to aid evaluation
+player_results$Avg_FB_Velo <- 0
+player_results$Avg_CB_Spin_Rate <- 0
+
+player_results$Avg_FB_Velo[1] <- round(
+  summary((playerA %>%
+             filter(PITCH_TYPE_KEY=="FB"))$RELEASE_SPEED)[4],2)
+
+player_results$Avg_FB_Velo[2] <- round(
+  summary((playerB %>%                                
+             filter(PITCH_TYPE_KEY=="FB"))$RELEASE_SPEED)[4],2)
+
+player_results$Avg_CB_Spin_Rate[1] <- round(
+  summary((playerA %>%
+             filter(PITCH_TYPE_KEY=="CB"))$SPIN_RATE)[4],2)
+
+player_results$Avg_CB_Spin_Rate[2] <- round(
+  summary((playerB %>%
+             filter(PITCH_TYPE_KEY=="CB"))$SPIN_RATE)[4],2)
+
+```
+
+Let's check to see if the velocities and spin rates are statistically different from one another. First, however, we have to check if they have equal variances
+
+```{r Equal Variance Testing for Two-Sample T-Test}
+var.test(RELEASE_SPEED ~ PITCHER_KEY, data = (visuals %>% filter(PITCH_TYPE_KEY=='FB')))
+var.test(SPIN_RATE ~ PITCHER_KEY, data = (visuals %>% filter( PITCH_TYPE_KEY=='CB')))
+```
+Since the variance test showed FB Velocity has a different variance, unequal variances will need to be specified for that t-test but not between Curveball spinrates.
+
+```{r FB Velo and CB Spin Rate Two-Sample T-Tests}
+t.test(RELEASE_SPEED ~ PITCHER_KEY,
+       data = (visuals %>% 
+                 filter(PITCH_TYPE_KEY=='FB')), var.equal=F)
+t.test(SPIN_RATE ~ PITCHER_KEY,
+         data = (visuals %>% 
+                   filter(PITCH_TYPE_KEY=='CB')),var.equal=T)
+```
+There's an overwhelming amount of statistical evidence that the Fastball velocities are somewhere between 4.26 to 4.47 mph higher for player A and the Curveball Spin Rate is between 961.46 to 1090.32 RPM higher for player A compared to player B. These statistical arguments support my claims as to player A having a strong advantage in the raw "stuff" factor considerations.
+
+```{r Giving the counts and percentages of pitch results}
+print("PLAYER A PITCH RESULTS")
+summary(playerA$PITCH_RESULT_KEY)
+summary(playerA$PITCH_RESULT_KEY)[1]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[2]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[3]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[4]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[5]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[6]/nrow(playerA)
+summary(playerA$PITCH_RESULT_KEY)[7]/nrow(playerA)
+#Overall K%
+playerA_K_perc <- 1-as.numeric(summary(playerA$PITCH_RESULT_KEY)[1] 
+ + summary(playerA$PITCH_RESULT_KEY)[3])/nrow(playerA)
+playerA_K_perc
+
+print("PLAYER B PITCH RESULTS")
+summary(playerB$PITCH_RESULT_KEY)
+summary(playerB$PITCH_RESULT_KEY)[1]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[2]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[3]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[4]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[5]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[6]/nrow(playerB)
+summary(playerB$PITCH_RESULT_KEY)[7]/nrow(playerB)
+#Overall K%
+playerB_K_perc <- 1-as.numeric(summary(playerB$PITCH_RESULT_KEY)[1] 
+ + summary(playerB$PITCH_RESULT_KEY)[3])/nrow(playerB)
+playerB_K_perc
+```
+
+There was a lower percentage of pitches put in play off player A (A: 12.19% | B: 14.07%) while the swing and miss rate was a bit higher for player A which is what we would prefer(A: 14.46% | B: 14.23%). Player A also threw a higher proportion of called strikes (A: 17.32% | B: 15.07%). Their respective overall strike percents were almost identical at 63.54% for Player A and 62.54% for player B. Let's test if any of these proportions are statistically different with a two-sample z-test
+```{r Outcome Percentage Two-Proportion Z-Tests}
+#Testing Called Ball Statistical difference
+prop.test(x = c(summary(playerA$PITCH_RESULT_KEY)[1],
+  summary(playerB$PITCH_RESULT_KEY)[1]),
+ n = c(nrow(playerA), nrow(playerB)))
+#Testing Called Strike Statistical difference
+prop.test(x = c(summary(playerA$PITCH_RESULT_KEY)[6],
+  summary(playerB$PITCH_RESULT_KEY)[6]),
+ n = c(nrow(playerA), nrow(playerB)))
+#Testing In play Statistical difference
+prop.test(x = c(summary(playerA$PITCH_RESULT_KEY)[4],
+  summary(playerB$PITCH_RESULT_KEY)[4]),
+ n = c(nrow(playerA), nrow(playerB)))
+```
+
+While I only showed 3 of the 2-prop z-tests, there was not a statistical difference for any of the proportions at an alpha-level of 0.05 meaning Player A's slight edge in these values is insignificant
+
+
+```{r Viewing Results and Summaries}
+player_results
+player_results %>% select(strikeout,walk,IP,WHIP,FIP)
+player_results %>% select(Avg_FB_Velo,Avg_CB_Spin_Rate)
+#Player A has 148k/66bb where Player B is 152k/48bb
+
+#Righty Player A
+summary(playerA)
+#Fast, Slide, Curve, Occasional Change and Four Seam FB
+#96.17 Avg FB Velo and 1820.84 Avg CB Spin Rate
+
+#Lefty Player B
+summary(playerB)
+#Fast, Curve, Change, Slide, Occasional FF, Sinker and Other
+#91.81 Avg FB Velo and 794.954 Avg CB Spin Rate
+```
+
+Final Conclusions
+----------------------------------------
+Despite Player B's FIP and K/BB being better, with the similarity of the other stats such as and identical Innings Pitched and SB against %, I would like to see Player A as a player to build our rotation around. Player B had more success in this minor league season but I prefer the higher ceiling of Player A based on his elite fastball velocity as visualized in the dashboard.
+
+```{r Option to Run All Above}
+#Final chunk to run all above
+```
